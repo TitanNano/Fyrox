@@ -18,22 +18,25 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use crate::visitor::{
-    field::{Field, FieldKind},
-    VisitResult, VisitableElementaryField, Visitor, VisitorNode,
+use crate::{
+    pool::Handle,
+    visitor::{
+        field::{Field, FieldKind},
+        VisitResult, VisitableElementaryField, Visitor, VisitorNode,
+    },
 };
 use base64::Engine;
 use byteorder::{LittleEndian, WriteBytesExt};
 use nalgebra::SVector;
-use std::fmt::Display;
 use std::io::Write;
+use std::{collections::VecDeque, fmt::Display};
 
 pub trait Writer {
     fn write_field(&self, field: &Field, dest: &mut dyn Write) -> VisitResult;
     fn write_node(
         &self,
         visitor: &Visitor,
-        node: &VisitorNode,
+        node: &Handle<VisitorNode>,
         hierarchy_level: usize,
         dest: &mut dyn Write,
     ) -> VisitResult;
@@ -262,11 +265,12 @@ impl Writer for BinaryWriter {
 
     fn write_node(
         &self,
-        _visitor: &Visitor,
-        node: &VisitorNode,
+        visitor: &Visitor,
+        handle: &Handle<VisitorNode>,
         _hierarchy_level: usize,
         dest: &mut dyn Write,
     ) -> VisitResult {
+        let node = visitor.nodes.borrow(*handle);
         let name = node.name.as_bytes();
         dest.write_u32::<LittleEndian>(name.len() as u32)?;
         dest.write_all(name)?;
@@ -284,9 +288,8 @@ impl Writer for BinaryWriter {
         dest.write_all(Visitor::MAGIC_BINARY.as_bytes())?;
         let mut stack = vec![visitor.root];
         while let Some(node_handle) = stack.pop() {
-            let node = visitor.nodes.borrow(node_handle);
-            self.write_node(visitor, node, 0, dest)?;
-            stack.extend_from_slice(&node.children);
+            self.write_node(visitor, &node_handle, 0, dest)?;
+            stack.extend_from_slice(&visitor.nodes.borrow(node_handle).children);
         }
         Ok(())
     }
@@ -310,7 +313,7 @@ impl Writer for AsciiWriter {
             Ok(())
         }
 
-        write!(dest, "{}", field.name)?;
+        write!(dest, "{} = ", field.name)?;
         match field.kind {
             FieldKind::Bool(data) => write!(dest, "<bool:{data}>")?,
             FieldKind::U8(data) => write!(dest, "<u8:{data}>")?,
@@ -451,6 +454,7 @@ impl Writer for AsciiWriter {
                 write!(dest, ">")?;
             }
         }
+        writeln!(dest)?;
 
         Ok(())
     }
@@ -458,51 +462,49 @@ impl Writer for AsciiWriter {
     fn write_node(
         &self,
         visitor: &Visitor,
-        node: &VisitorNode,
+        handle: &Handle<VisitorNode>,
         hierarchy_level: usize,
         dest: &mut dyn Write,
     ) -> VisitResult {
-        fn align(count: usize, dest: &mut dyn Write) -> VisitResult {
-            for _ in 0..count {
-                write!(dest, "\t")?;
+        let node = visitor.nodes.borrow(*handle);
+
+        writeln!(dest, "[{}:{}]", node.name, handle.index())?;
+
+        write!(dest, "children = [")?;
+
+        let mut children = node.children.iter().peekable();
+
+        while let Some(child_handle) = children.next() {
+            write!(dest, "{}", child_handle.index())?;
+
+            if children.peek().is_some() {
+                write!(dest, ",")?;
             }
-            Ok(())
         }
 
-        align(hierarchy_level, dest)?;
-        writeln!(dest, "{}", node.name)?;
-
-        align(hierarchy_level, dest)?;
-        write!(dest, "[{}:", node.fields.len())?;
+        writeln!(dest, "]")?;
 
         for field in node.fields.iter() {
-            writeln!(dest)?;
-            align(hierarchy_level + 1, dest)?;
             self.write_field(field, dest)?;
         }
 
         writeln!(dest)?;
-
-        align(hierarchy_level, dest)?;
-        writeln!(dest, "]")?;
-
-        align(hierarchy_level, dest)?;
-        writeln!(dest, "{{{}:", node.children.len())?;
-
-        for child_handle in node.children.iter() {
-            let child = visitor.nodes.borrow(*child_handle);
-            self.write_node(visitor, child, hierarchy_level + 1, dest)?;
-        }
-
-        align(hierarchy_level, dest)?;
-        writeln!(dest, "}}")?;
 
         Ok(())
     }
 
     fn write(&self, visitor: &Visitor, dest: &mut dyn Write) -> VisitResult {
         writeln!(dest, "{}", Visitor::MAGIC_ASCII)?;
-        self.write_node(visitor, &visitor.nodes[visitor.root], 0, dest)
+
+        let mut queue = VecDeque::from([visitor.root]);
+
+        while let Some(node_handle) = queue.pop_front() {
+            self.write_node(visitor, &node_handle, 0, dest)?;
+
+            queue.extend(visitor.nodes.borrow(node_handle).children.iter());
+        }
+
+        Ok(())
     }
 }
 

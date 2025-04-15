@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 use crate::{
+    log::Log,
     pool::{Handle, Pool},
     visitor::{
         blackboard::Blackboard,
@@ -33,7 +34,11 @@ use nalgebra::{
     Complex, Const, Matrix, Matrix2, Matrix3, Matrix4, Quaternion, RawStorage, RawStorageMut,
     SMatrix, SVector, Scalar, UnitComplex, UnitQuaternion, Vector2, Vector3, Vector4, U1,
 };
-use std::{io::Read, str::FromStr};
+use std::{
+    collections::VecDeque,
+    io::{self, ErrorKind, Read},
+    str::FromStr,
+};
 use uuid::Uuid;
 
 pub trait Reader {
@@ -429,7 +434,9 @@ impl Reader for AsciiReader<'_> {
     fn read_field(&mut self) -> Result<Field, VisitError> {
         let src = &mut self.src;
 
-        let name = src.read_str_until_skip_ws(b'<')?;
+        let name = src.read_str_until_skip_ws(b'=')?;
+
+        src.read_str_until_skip_ws(b'<')?;
         let ty = src.read_str_until_skip_ws(b':')?;
 
         let kind = match ty.as_ref() {
@@ -521,45 +528,69 @@ impl Reader for AsciiReader<'_> {
     }
 
     fn read_node(&mut self, visitor: &mut Visitor) -> Result<Handle<VisitorNode>, VisitError> {
-        let src = &mut self.src;
-        let name = src.read_str_until_skip_ws(b'[')?;
+        // skip_until should be named skip_while
+        self.src.skip_until(|char| char != b'[')?;
+        self.src.skip_n(1)?;
+
+        let name = self.src.read_str_until_skip_ws(b':')?;
+        let index = self.src.read_num_until(b']')?;
 
         let mut node = VisitorNode {
             name,
             ..VisitorNode::default()
         };
 
-        let field_count: usize = src.read_num_until(b':')?;
-        for _ in 0..field_count {
+        let children_label = self.src.read_str_until_skip_ws(b'=')?;
+
+        if children_label != "children" {
+            return Err(VisitError::InvalidCurrentNode);
+        }
+
+        self.src.skip_until(|char| char != b'[')?;
+        self.src.skip_n(1)?;
+
+        let mut children = Vec::new();
+        loop {
+            if self.src.peek()? == b',' {
+                self.src.skip_n(1)?;
+            }
+
+            if self.src.peek()? == b']' {
+                self.src.skip_n(1)?;
+                break;
+            }
+
+            let index: u32 = self
+                .src
+                // should be named read_str_while
+                .read_str_until(|char| char != b',' && char != b']')?
+                .parse()?;
+
+            children.push(Handle::<VisitorNode>::new(index, 1));
+        }
+
+        loop {
+            match self.src.skip_ws() {
+                Ok(()) => (),
+                Err(VisitError::Io(err)) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+
+                Err(err) => return Err(err),
+            };
+
+            if self.src.peek()? == b'[' {
+                break;
+            }
+
             node.fields.push(self.read_field()?);
         }
 
-        let src = &mut self.src;
-
-        src.skip_until(|ch| ch != b']')?;
-        src.skip_n(1)?;
-
-        src.skip_until(|ch| ch != b'{')?;
-        src.skip_n(1)?;
-
-        let child_count: usize = src.read_num_until(b':')?;
-        let mut children = Vec::with_capacity(child_count);
-        for _ in 0..child_count {
-            children.push(self.read_node(visitor)?);
-        }
-
-        let src = &mut self.src;
-
-        src.skip_until(|ch| ch != b'}')?;
-        src.skip_n(1)?;
-
         node.children.clone_from(&children);
 
-        let handle = visitor.nodes.spawn(node);
-        for child_handle in children.iter() {
-            let child = visitor.nodes.borrow_mut(*child_handle);
-            child.parent = handle;
-        }
+        let handle = visitor.nodes.spawn_at(index, node).unwrap();
+
+        Log::info(format!("inserted node at index {index}: {handle:?}"));
 
         Ok(handle)
     }
@@ -583,6 +614,36 @@ impl Reader for AsciiReader<'_> {
         };
         visitor.root = self.read_node(&mut visitor)?;
         visitor.current_node = visitor.root;
+
+        loop {
+            if self.src.peek().is_err_and(|err| {
+                if let VisitError::Io(err) = err {
+                    err.kind() == ErrorKind::UnexpectedEof
+                } else {
+                    false
+                }
+            }) {
+                break;
+            }
+
+            self.read_node(&mut visitor)?;
+        }
+
+        let mut queue = VecDeque::from([visitor.root]);
+
+        while let Some(handle) = queue.pop_front() {
+            let node = visitor.nodes.borrow(handle);
+
+            queue.extend(node.children.iter());
+
+            let children = node.children.clone();
+
+            for child_handle in children {
+                let child = visitor.nodes.borrow_mut(child_handle);
+
+                child.parent = handle;
+            }
+        }
         Ok(visitor)
     }
 }

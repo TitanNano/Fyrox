@@ -492,7 +492,7 @@ where
                 for i in self.records_len()..index {
                     self.records.push(PoolRecord {
                         ref_counter: Default::default(),
-                        generation: 1,
+                        generation: INVALID_GENERATION,
                         payload: Payload::new_empty(),
                     });
                     self.free_stack.push(i);
